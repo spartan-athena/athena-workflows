@@ -1,0 +1,71 @@
+name: Destroy lab infrastructure
+
+on:
+  workflow_call:
+    inputs:
+      athena_run_id:
+        description: Night run id from Athena
+        required: true
+        type: string
+      aws_account_id:
+        description: The lease account Athena expects this repo to act on
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  destroy:
+    name: Destroy live/
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      WANT_ACCOUNT: ${{ inputs.aws_account_id }}
+      REPO_ACCOUNT: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+    steps:
+      - name: Refuse when Athena and this repo disagree on the account
+        run: |
+          if ! [[ "$WANT_ACCOUNT" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::aws_account_id is not a 12 digit account id"
+            exit 1
+          fi
+          if [ "$WANT_ACCOUNT" != "$REPO_ACCOUNT" ]; then
+            echo "::error::Athena asked to destroy in $WANT_ACCOUNT but this repo is set to $REPO_ACCOUNT"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.aws_account_id }}:role/athena-lab-deploy
+          role-session-name: athena-destroy-${{ inputs.athena_run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Refuse when the assumed role lands in another account
+        run: |
+          got=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$got" != "$WANT_ACCOUNT" ]; then
+            echo "::error::the role landed in $got, not $WANT_ACCOUNT"
+            exit 1
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.3
+          terraform_wrapper: false
+
+      - name: Terraform destroy
+        working-directory: live
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=live/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+          terraform destroy -input=false -auto-approve
